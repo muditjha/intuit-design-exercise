@@ -35,7 +35,7 @@ Unknown. v1 is a single JVM, in-memory, with every store behind an interface so 
 | `Spot` | `id, garageId, label` | The thing that gets booked. Never deleted. `label` is the human spot number, e.g. "L2-14". |
 | `Driver` | `id, name` | Books, checks in and out. Unknown driver is rejected. The one-spot rule (I2) is keyed on `Driver.id`. |
 | `Operator` | `id, name, garageIds` | Schedules maintenance and reads availability, scoped to `garageIds` (A12). |
-| `Reservation` | `id, driverId, spotId, window, status, cancelReason, replacesId, version` | A driver's booking of one spot for one window. Also the saga record and the history. |
+| `Reservation` | `id, driverId, spotId, window, status, reason, replacesId, version` | A driver's booking of one spot for one window. Also the saga record and the history. |
 | `MaintenanceWindow` | `id, operatorId, spotId, window, status, version` | An operator's scheduled block on a spot; records who did it. |
 | `IdempotencyRecord` | `key, requestFingerprint, status, resultRef` | Makes client retries safe. |
 
@@ -53,7 +53,7 @@ Relationships: Garage 1—N Spot · Driver 1—N Reservation (≤1 live, I2) · 
 - `OccupancyIndex` — `claim(spotId, resId)` putIfAbsent (one car per spot) · `release(spotId, resId)` conditional.
 - `ReservationRepository` — `insert`, `get`, `compareAndSet(id, expectedStatus, expectedVersion, next)`.
 - `MaintenanceRepository` — `insert`, `get`, `compareAndSet`.
-- `IdempotencyStore` — `putIfAbsent`, `complete`.
+- `IdempotencyStore` — `find` (read-only), `putIfAbsent`, `complete`.
 - Read-only reference repos: `GarageRepository`, `SpotRepository` (`findById`, `findByGarage`), `DriverRepository`, `OperatorRepository`.
 
 ### Services
@@ -64,14 +64,19 @@ Relationships: Garage 1—N Spot · Driver 1—N Reservation (≤1 live, I2) · 
 - `java.time.Clock` is injected everywhere.
 
 ### Reserve flow (the reference shape for all write flows)
-1. Validate, read-only: driver exists, spot exists, `now < start < end`. Rejected → nothing written.
-2. `IdempotencyStore.putIfAbsent` — the first write. Key exists: same fingerprint → return the stored outcome; different fingerprint → reject `KEY_REUSED`.
+`reserve` returns `ReserveResult(status, reservationId, reason)`, with status SUCCEEDED, REJECTED or FAILED.
+
+0. Idempotency lookup, read-only: `IdempotencyStore.find(key)`. If a record exists, go to **Key exists** below. (This comes first so a retry after `start` has passed still returns its stored outcome.)
+1. Validate, read-only: driver exists, spot exists, `now < start < end`. Rejected → REJECTED with a reason, no reservationId, nothing written.
+2. `IdempotencyStore.putIfAbsent` (IN_PROGRESS) — the first write. If a concurrent request inserted the key first, go to **Key exists**.
 3. Insert Reservation `PENDING` (the saga record; a crash leaves something the sweeper can find).
 4. `DriverIndex.claim` → fails: reservation REJECTED(`DRIVER_HAS_RESERVATION`).
 5. `SpotCalendar.tryBook` → fails: release the driver claim, reservation REJECTED(`SLOT_TAKEN`).
 6. CAS `PENDING → ACTIVE`; complete the idempotency record.
 
-Any exception after step 3 → undo completed steps in reverse, reservation FAILED, idempotency record FAILED. The sweeper unwinds stale PENDING records the same way.
+Any exception from step 3 onward → undo completed steps in reverse, reservation FAILED (if it was inserted), idempotency record FAILED. The sweeper unwinds stale PENDING records the same way.
+
+**Key exists:** different fingerprint → REJECTED(`KEY_REUSED`), nothing written. Same fingerprint and IN_PROGRESS → throw `RequestInProgressException`. Same fingerprint and completed → return the stored outcome unchanged.
 
 ## States
 
@@ -105,6 +110,7 @@ First match wins, so exactly one applies:
 - E3 Overstay: a parked car runs past `end` while the next booking starts. v1: the next driver's check-in fails `SPOT_OCCUPIED`; they can change spot.
 - E4 Drain can overrun: if the car stays past the maintenance end, maintenance effectively never happens. v1 accepts this.
 - E5 Conflicts found at write time (slot taken, driver busy) leave REJECTED records after the idempotency record. "A rejected request writes nothing" applies to validation failures.
+- E8 A crash between `putIfAbsent` and `complete` leaves the key IN_PROGRESS, so every retry throws `RequestInProgressException` until the sweeper (Story 4) resolves the record.
 - E6 A no-show blocks new bookings until the next sweep; the view shows FREE after grace. This errs on the safe side.
 - E7 The snapshot isn't atomic across spots: each spot is correct at the moment it's read, not all at one frozen instant.
 
